@@ -1,84 +1,109 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
-import type { Proposal } from '../server/agent';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 
-type Provider = { id: string; name: string; kind: 'openai' | 'ollama'; baseUrl: string; model: string; hasKey?: boolean };
-type Entry = { role: 'user' | 'assistant'; content: string; id?: string; proposal?: Proposal; canApply?: boolean; sent?: boolean };
-type Status = { studio: { placeName: string; items: unknown[]; truncated: boolean } | null; jobs: { id: string; status: string; message: string }[] };
-const emptyProvider = (): Provider & { apiKey: string } => ({ id: crypto.randomUUID(), name: '', kind: 'openai', baseUrl: 'https://api.openai.com/v1', model: '', apiKey: '' });
+type Provider = { id: string; name: string; kind: 'openai' | 'ollama'; baseUrl: string; model: string; hasKey?: boolean; apiKey?: string };
+type McpServer = { name: string; command: string; args: string[]; env: Record<string, string>; status?: { connected: boolean; pid: number | null; tools: number } };
+type McpTool = { serverName: string; name: string; description?: string; inputSchema?: unknown };
+type PlannedCall = { serverName: string; toolName: string; arguments: unknown; reason: string; risk: 'low' | 'medium' | 'high' };
+type Plan = { summary: string; assumptions: string[]; calls: PlannedCall[]; manualSteps: string[]; safetyNotes: string[] };
+type Entry = { role: 'user' | 'assistant'; content: string; plan?: Plan; executed?: boolean; id: string };
+type State = { providers: Provider[]; mcpServers: McpServer[]; selectedProviderId: string };
+const api = window.studioAgent;
+const blankProvider = (): Provider => ({ id: crypto.randomUUID(), name: '', kind: 'openai', baseUrl: 'https://api.openai.com/v1', model: '', apiKey: '' });
+const defaultPrompt = 'Crie um obby bonito com tema neon, spawn, checkpoints simples e uma chegada com mensagem de vitória.';
+
 export default function App() {
-  const [token, setToken] = useState(() => sessionStorage.getItem('agent-token') ?? '');
-  const [tokenInput, setTokenInput] = useState('');
-  const [ready, setReady] = useState(false);
-  const [tab, setTab] = useState<'chat' | 'settings'>('chat');
-  const [providers, setProviders] = useState<Provider[]>([]);
-  const [selected, setSelected] = useState('');
-  const [form, setForm] = useState(emptyProvider);
-  const [status, setStatus] = useState<Status>({ studio: null, jobs: [] });
+  const [state, setState] = useState<State>({ providers: [], mcpServers: [], selectedProviderId: '' });
+  const [tab, setTab] = useState<'home' | 'providers' | 'mcp'>('home');
+  const [providerForm, setProviderForm] = useState<Provider>(blankProvider);
+  const [mcpText, setMcpText] = useState('');
+  const [tools, setTools] = useState<McpTool[]>([]);
   const [entries, setEntries] = useState<Entry[]>([]);
-  const [prompt, setPrompt] = useState('');
+  const [prompt, setPrompt] = useState(defaultPrompt);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
-  const api = useCallback(async <T,>(path: string, method = 'GET', body?: unknown): Promise<T> => {
-    const response = await fetch('/api' + path, { method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
-    const data = await response.json();
-    if (!response.ok) {
-      if (response.status === 401) setReady(false);
-      throw new Error(data.error ?? 'Não foi possível concluir a operação');
-    }
-    return data as T;
-  }, [token]);
-  const loadProviders = useCallback(async () => {
-    const list = await api<Provider[]>('/providers');
-    setProviders(list);
-    setSelected(current => list.some(p => p.id === current) ? current : list[0]?.id ?? '');
-  }, [api]);
-  useEffect(() => {
-    if (!token) return;
-    let live = true;
-    const refresh = async () => {
-      try { const next = await api<Status>('/status'); if (live) { setStatus(next); setReady(true); } }
-      catch (e) { if (live) setError((e as Error).message); }
-    };
-    void loadProviders().catch(e => { if (live) setError((e as Error).message); });
-    void refresh();
-    const timer = setInterval(() => { void refresh(); }, 5000);
-    return () => { live = false; clearInterval(timer); };
-  }, [token, api, loadProviders]);
-  async function action(fn: () => Promise<void>) {
+  const selectedProvider = state.providers.find(p => p.id === state.selectedProviderId);
+  const connected = state.mcpServers.some(server => server.status?.connected);
+  const dangerCount = useMemo(() => entries.flatMap(e => e.plan?.calls ?? []).filter(call => call.risk === 'high').length, [entries]);
+
+  async function refresh() {
+    const next = await api.state() as State;
+    setState(next);
+    setMcpText(JSON.stringify({ mcpServers: Object.fromEntries(next.mcpServers.map(server => [server.name, { command: server.command, args: server.args, env: server.env }])) }, null, 2));
+  }
+  useEffect(() => { void run(refresh); }, []);
+  async function run(fn: () => Promise<void>) {
     setBusy(true); setError(''); setNotice('');
     try { await fn(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   }
-  function connect(event: FormEvent) {
+  async function saveProvider(event: FormEvent) {
     event.preventDefault();
-    const value = tokenInput.trim();
-    sessionStorage.setItem('agent-token', value); setToken(value); setTokenInput(''); setError('');
+    await run(async () => {
+      const result = await api.saveProvider(providerForm) as { providers: Provider[]; selectedProviderId: string };
+      setState(previous => ({ ...previous, ...result }));
+      setProviderForm(blankProvider());
+      setNotice('Provider salvo com segurança no computador.');
+    });
+  }
+  async function saveMcp(event: FormEvent) {
+    event.preventDefault();
+    await run(async () => {
+      const parsed = JSON.parse(mcpText) as { mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> };
+      const servers = Object.entries(parsed.mcpServers ?? {}).map(([name, config]) => ({ name, command: config.command, args: config.args ?? [], env: config.env ?? {} }));
+      const mcpServers = await api.saveMcpServers(servers) as McpServer[];
+      setState(previous => ({ ...previous, mcpServers }));
+      setNotice('Configuração MCP salva.');
+    });
+  }
+  async function connectAllMcp() {
+    await run(async () => {
+      const collected: McpTool[] = [];
+      let servers = state.mcpServers;
+      for (const server of state.mcpServers) {
+        const result = await api.connectMcp(server.name) as { tools: McpTool[]; servers: McpServer[] };
+        collected.push(...result.tools); servers = result.servers;
+      }
+      setTools(collected); setState(previous => ({ ...previous, mcpServers: servers }));
+      setNotice(`${collected.length} ferramentas MCP disponíveis.`);
+    });
   }
   async function send(event: FormEvent) {
     event.preventDefault();
-    if (busy || !prompt.trim()) return;
+    if (!prompt.trim() || !selectedProvider) return;
     const request = prompt.trim();
-    const history = entries.slice(-12).map(e => ({ role: e.role, content: e.content.slice(0, 30000) }));
-    setEntries(previous => [...previous, { role: 'user', content: request }]); setPrompt('');
-    await action(async () => {
-      const result = await api<{ id: string; proposal: Proposal; canApply: boolean }>('/chat', 'POST', { providerId: selected, prompt: request, history });
-      setEntries(previous => [...previous, { role: 'assistant', content: result.proposal.summary, ...result }]);
+    setPrompt('');
+    setEntries(prev => [...prev, { id: crypto.randomUUID(), role: 'user', content: request }]);
+    await run(async () => {
+      const result = await api.plan({ providerId: selectedProvider.id, prompt: request, history: entries.map(({ role, content }) => ({ role, content })) }) as { plan: Plan; tools: McpTool[] };
+      setTools(result.tools);
+      setEntries(prev => [...prev, { id: crypto.randomUUID(), role: 'assistant', content: result.plan.summary, plan: result.plan }]);
     });
   }
-  async function saveProvider(event: FormEvent) {
-    event.preventDefault();
-    await action(async () => {
-      const { id, name, kind, baseUrl, model, apiKey } = form;
-      await api('/providers', 'POST', { id, name, kind, baseUrl, model, apiKey });
-      await loadProviders(); setSelected(id); setForm(emptyProvider()); setNotice('Provider salvo no computador.');
+  async function execute(entry: Entry) {
+    if (!selectedProvider || !entry.plan) return;
+    const high = entry.plan.calls.some(call => call.risk === 'high');
+    const ok = confirm(`${high ? 'Atenção: há ações de alto risco.\n\n' : ''}Executar ${entry.plan.calls.length} chamada(s) MCP no Roblox Studio? Revise tudo antes de confirmar.`);
+    if (!ok) return;
+    await run(async () => {
+      const result = await api.execute({ providerId: selectedProvider.id, prompt: entries.findLast(e => e.role === 'user')?.content ?? '', plan: entry.plan }) as { summary: string };
+      setEntries(prev => prev.map(item => item.id === entry.id ? { ...item, executed: true } : item).concat({ id: crypto.randomUUID(), role: 'assistant', content: result.summary }));
     });
   }
-  function download(entry: Entry) {
-    const url = URL.createObjectURL(new Blob([JSON.stringify(entry.proposal, null, 2)], { type: 'application/json' }));
-    const link = document.createElement('a'); link.href = url; link.download = 'roblox-proposal.json'; link.click(); URL.revokeObjectURL(url);
-  }
-  if (!ready) return <main className="connect"><div className="brand">R<span>✦</span></div><p className="eyebrow">ROBLOX AI AGENT</p><h1>Seu próximo jogo<br />começa aqui.</h1><p>Inicie o servidor local e cole o token exibido no console. Ele autentica este painel e o plugin do Studio.</p><form onSubmit={connect}><label htmlFor="token">Token local</label><input id="token" type="password" required value={tokenInput} onChange={e => setTokenInput(e.target.value)} autoComplete="off" placeholder="Cole o token do servidor" /><button className="primary">Conectar ao agente</button></form>{error && <p role="alert" className="error">{error}</p>}<small>Conexão local. Não compartilhe seu token.</small></main>;
-  return <div className="layout"><aside><div className="logo"><span className="brand small">R✦</span><strong>Studio Agent<small>IDEIAS → JOGOS</small></strong></div><button className={tab === 'chat' ? 'nav active' : 'nav'} onClick={() => setTab('chat')}>◈ Workspace</button><button className={tab === 'settings' ? 'nav active' : 'nav'} onClick={() => setTab('settings')}>⚙ Providers</button><div className="sidebar-bottom"><div className="connection"><span className={status.studio ? 'dot online' : 'dot'} />{status.studio ? 'Studio conectado' : 'Studio desconectado'}</div><small>{status.studio?.placeName ?? 'Abra o plugin e conecte o token'}</small><button className="text-button" onClick={() => { sessionStorage.removeItem('agent-token'); setToken(''); setReady(false); setEntries([]); setProviders([]); setStatus({ studio: null, jobs: [] }); }}>Desconectar painel</button></div></aside><main className="workspace"><header><div><p className="eyebrow">SEU COPILOTO DE CRIAÇÃO</p><h1>{tab === 'chat' ? 'Vamos construir algo incrível.' : 'Sua IA, do seu jeito.'}</h1></div><span className="badge">LOCAL FIRST</span></header>{error && <div className="error" role="alert">{error}</div>}{notice && <div className="notice" role="status">{notice}</div>}
-    {tab === 'settings' ? <section className="settings"><div><h2>Providers configurados</h2><p>Escolha seu modelo e mantenha o controle das credenciais.</p>{providers.map(provider => <article className="provider" key={provider.id}><div><strong>{provider.name}</strong><small>{provider.model} · {provider.kind === 'ollama' ? 'Ollama' : 'OpenAI-compatible'}</small><small>{provider.baseUrl}</small></div><div className="row"><button disabled={busy} onClick={() => setForm({ ...provider, apiKey: '' })}>Editar</button><button disabled={busy} onClick={() => void action(async () => { await api(`/providers/${provider.id}/test`, 'POST'); setNotice('Conexão com o provider confirmada.'); })}>Testar</button><button disabled={busy} onClick={() => { if (confirm(`Excluir o provider ${provider.name}?`)) void action(async () => { await api(`/providers/${provider.id}`, 'DELETE'); await loadProviders(); }); }}>Excluir</button></div></article>)}{!providers.length && <p className="empty">Nenhum provider ainda. Adicione o primeiro ao lado.</p>}<div className="info"><strong>Sobre suas chaves</strong><p>São armazenadas no servidor local, em <code>.local/providers.json</code>. Não são enviadas ao GitHub nem retornadas ao painel. O arquivo não é criptografado: proteja sua conta e seus backups.</p><p>O contexto e o código do jogo serão enviados ao provider selecionado. A geração pode consumir créditos.</p></div></div><form className="card" onSubmit={saveProvider}><h2>{providers.some(p => p.id === form.id) ? 'Editar provider' : 'Adicionar provider'}</h2><label>Nome<input required maxLength={80} value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="Minha IA" /></label><label>Tipo<select value={form.kind} onChange={e => setForm({ ...form, kind: e.target.value as Provider['kind'], baseUrl: e.target.value === 'ollama' ? 'http://127.0.0.1:11434' : 'https://api.openai.com/v1' })}><option value="openai">OpenAI-compatible</option><option value="ollama">Ollama local</option></select></label><label>URL base<input type="url" required value={form.baseUrl} onChange={e => setForm({ ...form, baseUrl: e.target.value })} /></label><small>OpenAI-compatible: inclua /v1 quando necessário. Ollama: sem /api.</small><label>Modelo<input required maxLength={200} value={form.model} onChange={e => setForm({ ...form, model: e.target.value })} placeholder="ID exato do modelo" /></label><label>Chave de API<input type="password" autoComplete="off" value={form.apiKey} onChange={e => setForm({ ...form, apiKey: e.target.value })} placeholder={form.hasKey ? 'Em branco mantém a chave atual' : 'Opcional para Ollama'} /></label><button className="primary" disabled={busy}>{busy ? 'Aguarde…' : 'Salvar provider'}</button><button type="button" disabled={busy} onClick={() => setForm(emptyProvider())}>Novo provider</button></form></section> : <><div className="toolbar"><label>Modelo ativo<select aria-label="Provider ativo" value={selected} onChange={e => setSelected(e.target.value)}><option value="">Selecione um provider</option>{providers.map(p => <option key={p.id} value={p.id}>{p.name} / {p.model}</option>)}</select></label><span>{status.studio ? `${status.studio.items.length} objetos no contexto${status.studio.truncated ? ' (parcial)' : ''}` : 'Sem contexto • propostas novas'}</span><button disabled={busy} onClick={() => { if (confirm('Limpar o histórico deste painel?')) setEntries([]); }}>Nova conversa</button></div><section className="conversation" aria-live="polite">{!entries.length && <div className="welcome"><div className="orb">✦</div><h2>Da ideia ao Roblox Studio.</h2><p>Descreva o jogo. O agente propõe o mapa, os scripts e a interface.<br />Você revisa e decide o que entra no projeto.</p><div className="suggestions">{['Crie um obby com 10 plataformas e uma chegada', 'Crie uma arena com spawn e placar básico', 'Crie uma interface de boas-vindas para meu jogo'].map(text => <button key={text} onClick={() => setPrompt(text)}>{text}<span>↗</span></button>)}</div></div>}{entries.map((entry, i) => <article className={`message ${entry.role}`} key={entry.id ?? i}><div className="message-label">{entry.role === 'user' ? 'VOCÊ' : 'STUDIO AGENT'}</div><p className="message-content">{entry.content}</p>{entry.proposal && <><div className="proposal-header">{entry.proposal.operations.length} alterações propostas</div>{entry.proposal.operations.map((op, index) => <details key={index}><summary><span>{op.className}</span> {op.path.join(' / ')}</summary><pre>{op.source ?? JSON.stringify(op.properties, null, 2)}</pre></details>)}<div className="row"><button className="primary" disabled={busy || entry.sent || !entry.canApply || !status.studio || !entry.proposal.operations.length} onClick={() => { if (!confirm('Revise todos os scripts. Enviar esta proposta para confirmação no Studio?')) return; void action(async () => { await api(`/proposals/${entry.id}/approve`, 'POST'); setEntries(previous => previous.map(e => e.id === entry.id ? { ...e, sent: true } : e)); setNotice('Proposta enviada. Confirme no plugin do Studio.'); }); }}>{entry.sent ? 'Enviado ao Studio' : 'Revisar no Studio →'}</button><button onClick={() => download(entry)}>Exportar JSON</button></div>{!entry.canApply && <small>Para aplicar: conecte o plugin e gere uma nova proposta.</small>}</>}</article>)}{busy && <div className="thinking" role="status">✦ Trabalhando… Isso pode levar até alguns minutos.</div>}</section><form className="composer" onSubmit={send}><textarea aria-label="Descreva seu jogo" maxLength={12000} rows={3} value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="Descreva seu jogo ou peça uma melhoria…" /><div><small>Revise o código gerado. IA pode errar. Teste no Studio antes de publicar.</small><button className="primary" disabled={busy || !selected || !prompt.trim()}>{busy ? 'Gerando…' : 'Criar proposta ↗'}</button></div></form>{status.jobs.length > 0 && <section className="job-log"><h3>Atividade do Studio</h3>{status.jobs.slice(-5).map(job => <p key={job.id}><strong>{job.status}</strong> — {job.message}</p>)}</section>}</>}
-  </main></div>;
+
+  return <div className="shell">
+    <aside className="sidebar">
+      <div className="logo"><div className="logo-mark">S✦</div><div><strong>Studio Agent</strong><span>Roblox MCP Desktop</span></div></div>
+      <button className={tab === 'home' ? 'nav active' : 'nav'} onClick={() => setTab('home')}>Workspace</button>
+      <button className={tab === 'providers' ? 'nav active' : 'nav'} onClick={() => setTab('providers')}>Providers</button>
+      <button className={tab === 'mcp' ? 'nav active' : 'nav'} onClick={() => setTab('mcp')}>Roblox MCP</button>
+      <div className="status-card"><span className={connected ? 'pulse on' : 'pulse'} />{connected ? 'MCP conectado' : 'MCP offline'}<small>{tools.length} ferramentas · {state.providers.length} providers</small>{dangerCount > 0 && <small className="warn">{dangerCount} ação(ões) de alto risco planejadas</small>}</div>
+    </aside>
+    <main className="main">
+      <header className="hero"><div><p className="eyebrow">AGENTE DESKTOP PARA ROBLOX STUDIO</p><h1>{tab === 'home' ? 'Crie jogos no Studio com IA e aprovação humana.' : tab === 'providers' ? 'Configure seu modelo de IA.' : 'Conecte ao MCP do Roblox Studio.'}</h1></div><button onClick={() => void run(refresh)} disabled={busy}>Atualizar</button></header>
+      {error && <div className="alert error">{error}</div>}{notice && <div className="alert notice">{notice}</div>}
+      {tab === 'home' && <section className="home-grid"><div className="chat-panel"><div className="topbar"><label>Provider ativo<select value={state.selectedProviderId} onChange={e => void run(async () => { await api.selectProvider(e.target.value); setState(p => ({ ...p, selectedProviderId: e.target.value })); })}><option value="">Selecione</option>{state.providers.map(provider => <option key={provider.id} value={provider.id}>{provider.name} · {provider.model}</option>)}</select></label><button onClick={connectAllMcp} disabled={busy}>Conectar MCP</button></div><div className="messages">{entries.length === 0 && <div className="empty-state"><div className="orb">✦</div><h2>Seu game designer com ferramentas reais.</h2><p>Abra o Roblox Studio, conecte o MCP e peça uma mudança. O agente planeja as chamadas e você aprova antes de mexer no Studio.</p><div className="chips">{['Crie um obby neon com checkpoints', 'Analise meu place e sugira melhorias', 'Crie uma arena de batalha com placar'].map(text => <button key={text} onClick={() => setPrompt(text)}>{text}</button>)}</div></div>}{entries.map(entry => <article key={entry.id} className={`message ${entry.role}`}><span>{entry.role === 'user' ? 'Você' : 'Studio Agent'}</span><p>{entry.content}</p>{entry.plan && <div className="plan"><h3>Plano de execução</h3>{entry.plan.assumptions.length > 0 && <ul>{entry.plan.assumptions.map(item => <li key={item}>{item}</li>)}</ul>}{entry.plan.calls.map((call, index) => <details key={`${call.toolName}-${index}`}><summary><b className={`risk ${call.risk}`}>{call.risk}</b>{call.serverName} / {call.toolName}</summary><p>{call.reason}</p><pre>{JSON.stringify(call.arguments, null, 2)}</pre></details>)}{entry.plan.manualSteps.length > 0 && <div className="manual"><b>Passos manuais</b>{entry.plan.manualSteps.map(step => <p key={step}>{step}</p>)}</div>}{entry.plan.safetyNotes.length > 0 && <div className="manual warnbox"><b>Segurança</b>{entry.plan.safetyNotes.map(step => <p key={step}>{step}</p>)}</div>}<button className="primary" disabled={busy || entry.executed || entry.plan.calls.length === 0} onClick={() => void execute(entry)}>{entry.executed ? 'Executado' : `Aprovar ${entry.plan.calls.length} chamada(s) MCP`}</button></div>}</article>)}{busy && <div className="thinking">Trabalhando…</div>}</div><form className="composer" onSubmit={send}><textarea value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="Descreva o jogo ou a alteração no Roblox Studio…" /><button className="primary" disabled={busy || !selectedProvider || !prompt.trim()}>Planejar com IA</button></form></div><aside className="inspector"><h2>Checklist</h2><div className="step done">App desktop Electron</div><div className={state.providers.length ? 'step done' : 'step'}>Provider configurado</div><div className={connected ? 'step done' : 'step'}>MCP Roblox conectado</div><div className={tools.length ? 'step done' : 'step'}>Ferramentas MCP carregadas</div><h2>Ferramentas</h2><div className="tool-list">{tools.slice(0, 18).map(tool => <div key={`${tool.serverName}-${tool.name}`}><strong>{tool.name}</strong><small>{tool.description || tool.serverName}</small></div>)}{!tools.length && <p>Conecte o MCP para listar ferramentas.</p>}</div></aside></section>}
+      {tab === 'providers' && <section className="split"><div><h2>Providers salvos</h2>{state.providers.map(provider => <article className="card" key={provider.id}><div><strong>{provider.name}</strong><small>{provider.kind} · {provider.model}</small><small>{provider.baseUrl}</small></div><div className="row"><button onClick={() => setProviderForm({ ...provider, apiKey: '' })}>Editar</button><button onClick={() => void run(async () => { await api.testProvider(provider.id); setNotice('Provider testado com sucesso.'); })}>Testar</button><button onClick={() => void run(async () => { const result = await api.deleteProvider(provider.id) as { providers: Provider[]; selectedProviderId: string }; setState(p => ({ ...p, ...result })); })}>Excluir</button></div></article>)}{!state.providers.length && <p className="muted">Adicione um provider para o agente pensar.</p>}</div><form className="form-card" onSubmit={saveProvider}><h2>{state.providers.some(p => p.id === providerForm.id) ? 'Editar provider' : 'Novo provider'}</h2><label>Nome<input required value={providerForm.name} onChange={e => setProviderForm({ ...providerForm, name: e.target.value })} placeholder="Minha IA" /></label><label>Tipo<select value={providerForm.kind} onChange={e => setProviderForm({ ...providerForm, kind: e.target.value as Provider['kind'], baseUrl: e.target.value === 'ollama' ? 'http://127.0.0.1:11434' : 'https://api.openai.com/v1' })}><option value="openai">OpenAI-compatible</option><option value="ollama">Ollama local</option></select></label><label>URL base<input required value={providerForm.baseUrl} onChange={e => setProviderForm({ ...providerForm, baseUrl: e.target.value })} /></label><label>Modelo<input required value={providerForm.model} onChange={e => setProviderForm({ ...providerForm, model: e.target.value })} placeholder="gpt-4.1, llama3.1, etc." /></label><label>Chave<input type="password" value={providerForm.apiKey ?? ''} onChange={e => setProviderForm({ ...providerForm, apiKey: e.target.value })} placeholder={providerForm.hasKey ? 'Em branco mantém a chave atual' : 'Opcional para Ollama'} /></label><button className="primary" disabled={busy}>Salvar provider</button><button type="button" onClick={() => setProviderForm(blankProvider())}>Limpar</button></form></section>}
+      {tab === 'mcp' && <section className="split"><div><h2>Servidores MCP</h2>{state.mcpServers.map(server => <article className="card" key={server.name}><div><strong>{server.name}</strong><small>{server.command} {server.args.join(' ')}</small><small>{server.status?.connected ? `Conectado · PID ${server.status.pid}` : 'Desconectado'}</small></div><button onClick={() => void run(async () => { const result = await api.connectMcp(server.name) as { tools: McpTool[]; servers: McpServer[] }; setTools(result.tools); setState(p => ({ ...p, mcpServers: result.servers })); })}>Conectar</button></article>)}<button onClick={() => void run(async () => { const mcpServers = await api.resetRobloxMcp() as McpServer[]; setState(p => ({ ...p, mcpServers })); setMcpText(JSON.stringify({ mcpServers: { Roblox_Studio: { command: 'cmd.exe', args: ['/c', '%LOCALAPPDATA%\\Roblox\\mcp.bat'] } } }, null, 2)); })}>Restaurar Roblox MCP padrão</button></div><form className="form-card wide" onSubmit={saveMcp}><h2>Configuração MCP</h2><p className="muted">Formato compatível com o que você mandou. O app expande variáveis como <code>%LOCALAPPDATA%</code>.</p><textarea className="jsonbox" value={mcpText} onChange={e => setMcpText(e.target.value)} spellCheck={false} /><button className="primary" disabled={busy}>Salvar MCP</button></form></section>}
+    </main>
+  </div>;
 }
