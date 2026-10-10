@@ -10,6 +10,7 @@ type State = { providers: Provider[]; mcpServers: McpServer[]; selectedProviderI
 const api = window.studioAgent;
 const blankProvider = (): Provider => ({ id: crypto.randomUUID(), name: '', kind: 'openai', baseUrl: 'https://api.openai.com/v1', model: '', apiKey: '' });
 const defaultPrompt = 'Crie um obby bonito com tema neon, spawn, checkpoints simples e uma chegada com mensagem de vitória.';
+const lastUserPrompt = (entries: Entry[]) => [...entries].reverse().find(entry => entry.role === 'user')?.content ?? '';
 
 export default function App() {
   const [state, setState] = useState<State>({ providers: [], mcpServers: [], selectedProviderId: '' });
@@ -85,7 +86,7 @@ export default function App() {
     const ok = confirm(`${high ? 'Atenção: há ações de alto risco.\n\n' : ''}Executar ${entry.plan.calls.length} chamada(s) MCP no Roblox Studio? Revise tudo antes de confirmar.`);
     if (!ok) return;
     await run(async () => {
-      const result = await api.execute({ providerId: selectedProvider.id, prompt: entries.findLast(e => e.role === 'user')?.content ?? '', plan: entry.plan }) as { summary: string };
+      const result = await api.execute({ providerId: selectedProvider.id, prompt: lastUserPrompt(entries), plan: entry.plan }) as { summary: string };
       setEntries(prev => prev.map(item => item.id === entry.id ? { ...item, executed: true } : item).concat({ id: crypto.randomUUID(), role: 'assistant', content: result.summary }));
     });
   }
